@@ -29,7 +29,15 @@ fn prop_config_send_recv_multi() {
                 let socket = listener.accept().await.expect("accept").0.compat();
                 let connection = Connection::new(socket, cfg1.0, Mode::Server);
 
-                EchoServer::new(connection).await
+                let (sender, mut receiver) = mpsc::channel(10);
+
+                tokio::spawn(async move {
+                    while let Some(stream) = receiver.next().await {
+                        echo(stream).await.unwrap();
+                    }
+                });
+
+                test_harness::server(connection, sender)
             };
 
             let client = async {
@@ -264,13 +272,13 @@ fn write_deadlock() {
                         writer.write_all(msg.as_ref()).map_err(|e| panic_any(e)),
                         reader.read_exact(&mut b[..]).map_err(|e| panic_any(e)),
                     )
-                    .await;
+                        .await;
                     let mut stream = reader.reunite(writer).unwrap();
                     stream.close().await.unwrap();
                     log::debug!("C: Stream {} done.", stream.id());
                     assert_eq!(b, msg);
                 }
-                .boxed(),
+                    .boxed(),
             )
             .unwrap(),
     );

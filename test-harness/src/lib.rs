@@ -301,18 +301,23 @@ pub async fn send_on_single_stream(
 }
 
 /// Make progress on the given [`Connection`], passing each stream into the given [`mpsc::Sender`].
+///
+/// Returns the number of streams processed.
 pub async fn server<T>(
     mut c: Connection<T>,
     mut sender: mpsc::Sender<yamux::Stream>,
-) -> Result<(), ConnectionError>
+) -> Result<u64, ConnectionError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut num_streams = 0;
+
     loop {
         let stream = future::poll_fn(|cx| c.poll_next_inbound(cx)).await?;
+        num_streams += 1;
 
         if sender.send(stream).await.is_err() {
-            return Ok(());
+            return Ok(num_streams);
         }
     }
 }
@@ -327,6 +332,16 @@ where
 
         drop(stream);
     }
+}
+
+pub async fn echo(mut stream: yamux::Stream) -> Result<(), ConnectionError> {
+    {
+        let (mut r, mut w) = AsyncReadExt::split(&mut stream);
+        futures::io::copy(&mut r, &mut w).await?;
+    }
+    stream.close().await?;
+
+    Ok(())
 }
 
 pub struct EchoServer<T> {
