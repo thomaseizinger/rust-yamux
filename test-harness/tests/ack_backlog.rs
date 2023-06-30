@@ -98,8 +98,8 @@ where
                     mut streams_processed,
                     mut worker_streams,
                 } => {
-                    match connection.poll_next_inbound(cx)? {
-                        Poll::Ready(Some(stream)) => {
+                    match connection.poll_next_inbound(cx) {
+                        Poll::Ready(Ok(stream)) => {
                             worker_streams.push(pong_ping(stream).boxed());
                             *this = Server::Accepting {
                                 connection,
@@ -108,8 +108,11 @@ where
                             };
                             continue;
                         }
-                        Poll::Ready(None) => {
+                        Poll::Ready(Err(ConnectionError::Closed)) => {
                             return Poll::Ready(Ok(streams_processed));
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err(e));
                         }
                         Poll::Pending => {}
                     }
@@ -216,13 +219,11 @@ where
             }
 
             // Allow the connection to make progress
-            match this.connection.poll_next_inbound(cx)? {
-                Poll::Ready(Some(_)) => {
-                    panic!("server never opens stream")
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(Ok(this.streams_processed));
-                }
+            match this.connection.poll(cx)? {
+                Poll::Ready(()) => continue,
+                // Poll::Ready(None) => {
+                //     return Poll::Ready(Ok(this.streams_processed));
+                // }
                 Poll::Pending => {}
             }
 

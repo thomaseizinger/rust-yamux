@@ -1,8 +1,9 @@
+use futures::channel::mpsc;
 use futures::executor::LocalPool;
 use futures::future::join;
 use futures::prelude::*;
 use futures::task::{Spawn, SpawnExt};
-use futures::{future, stream, AsyncReadExt, AsyncWriteExt, FutureExt, StreamExt};
+use futures::{future, AsyncReadExt, AsyncWriteExt, FutureExt, StreamExt};
 use quickcheck::QuickCheck;
 use std::iter;
 use std::panic::panic_any;
@@ -113,16 +114,15 @@ fn prop_send_recv_half_closed() {
         let msg_len = msg.0.len();
 
         Runtime::new().unwrap().block_on(async move {
-            let (mut server, mut client) =
+            let (server, mut client) =
                 connected_peers(Config::default(), Config::default(), None).await?;
+
+            let (sender, mut receiver) = mpsc::channel(1);
 
             // Server should be able to write on a stream shutdown by the client.
             let server = async {
-                let mut server = stream::poll_fn(move |cx| server.poll_next_inbound(cx));
-
-                let mut first_stream = server.next().await.ok_or(ConnectionError::Closed)??;
-
-                task::spawn(noop_server(server));
+                task::spawn(test_harness::server(server, sender));
+                let mut first_stream = receiver.next().await.ok_or(ConnectionError::Closed)?;
 
                 let mut buf = vec![0; msg_len];
                 first_stream.read_exact(&mut buf).await?;
@@ -137,9 +137,7 @@ fn prop_send_recv_half_closed() {
                 let mut stream = future::poll_fn(|cx| client.poll_new_outbound(cx))
                     .await
                     .unwrap();
-                task::spawn(noop_server(stream::poll_fn(move |cx| {
-                    client.poll_next_inbound(cx)
-                })));
+                task::spawn(noop_server(client));
 
                 stream.write_all(&msg.0).await?;
                 stream.close().await?;
@@ -180,7 +178,11 @@ fn prop_config_send_recv_single() {
                 let stream = future::poll_fn(|cx| client.poll_new_outbound(cx))
                     .await
                     .unwrap();
-                let client_task = noop_server(stream::poll_fn(|cx| client.poll_next_inbound(cx)));
+                let client_task = async {
+                    loop {
+                        future::poll_fn(|cx| client.poll(cx)).await.unwrap();
+                    }
+                };
 
                 future::select(pin!(client_task), pin!(send_on_single_stream(stream, msgs))).await;
 
@@ -246,11 +248,7 @@ fn write_deadlock() {
 
     // Continuously advance the Yamux connection of the client in a background task.
     pool.spawner()
-        .spawn_obj(
-            noop_server(stream::poll_fn(move |cx| client.poll_next_inbound(cx)))
-                .boxed()
-                .into(),
-        )
+        .spawn_obj(noop_server(client).map(|r| r.unwrap()).boxed().into())
         .unwrap();
 
     // Send the message, expecting it to be echo'd.

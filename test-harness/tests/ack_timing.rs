@@ -65,15 +65,12 @@ where
         loop {
             match mem::replace(this, Self::Poisoned) {
                 Self::Accepting { mut connection } => match connection.poll_next_inbound(cx)? {
-                    Poll::Ready(Some(stream)) => {
+                    Poll::Ready(stream) => {
                         *this = Self::Working {
                             connection,
                             stream: pong_ping(stream).boxed(),
                         };
                         continue;
-                    }
-                    Poll::Ready(None) => {
-                        panic!("connection closed before receiving a new stream")
                     }
                     Poll::Pending => {
                         *this = Self::Accepting { connection };
@@ -92,24 +89,16 @@ where
                         Poll::Pending => {}
                     }
 
-                    match connection.poll_next_inbound(cx)? {
-                        Poll::Ready(Some(_)) => {
-                            panic!("not expecting new stream");
-                        }
-                        Poll::Ready(None) => {
-                            panic!("connection closed before stream completed")
-                        }
+                    match connection.poll(cx)? {
+                        Poll::Ready(()) => continue,
                         Poll::Pending => {
                             *this = Self::Working { connection, stream };
                             return Poll::Pending;
                         }
                     }
                 }
-                Self::Idle { mut connection } => match connection.poll_next_inbound(cx)? {
-                    Poll::Ready(Some(_)) => {
-                        panic!("not expecting new stream");
-                    }
-                    Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Self::Idle { mut connection } => match connection.poll(cx)? {
+                    Poll::Ready(()) => continue,
                     Poll::Pending => {
                         *this = Self::Idle { connection };
                         return Poll::Pending;
@@ -173,13 +162,8 @@ where
                         Poll::Pending => {}
                     }
 
-                    match connection.poll_next_inbound(cx)? {
-                        Poll::Ready(Some(_)) => {
-                            panic!("not expecting new stream");
-                        }
-                        Poll::Ready(None) => {
-                            panic!("connection closed before stream completed")
-                        }
+                    match connection.poll(cx)? {
+                        Poll::Ready(()) => continue,
                         Poll::Pending => {
                             *this = Self::Working { connection, stream };
                             return Poll::Pending;

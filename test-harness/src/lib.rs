@@ -1,9 +1,10 @@
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{
-    future, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, TryStreamExt,
+    channel::mpsc, future, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, SinkExt, StreamExt,
+    TryStreamExt,
 };
-use futures::{stream, FutureExt, Stream};
+use futures::{stream, FutureExt};
 use quickcheck::{Arbitrary, Gen};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -72,16 +73,26 @@ pub async fn echo_server<T>(mut c: Connection<T>) -> Result<(), ConnectionError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    stream::poll_fn(|cx| c.poll_next_inbound(cx))
-        .try_for_each_concurrent(None, |mut stream| async move {
-            {
-                let (mut r, mut w) = AsyncReadExt::split(&mut stream);
-                futures::io::copy(&mut r, &mut w).await?;
-            }
-            stream.close().await?;
-            Ok(())
-        })
-        .await
+    stream::poll_fn(|cx| loop {
+        if let Poll::Ready(stream) = c.poll_next_inbound(cx) {
+            return Poll::Ready(Some(stream));
+        }
+
+        match c.poll(cx) {
+            Poll::Ready(Ok(())) => continue,
+            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+            Poll::Pending => return Poll::Pending,
+        }
+    })
+    .try_for_each_concurrent(None, |mut stream| async move {
+        {
+            let (mut r, mut w) = AsyncReadExt::split(&mut stream);
+            futures::io::copy(&mut r, &mut w).await?;
+        }
+        stream.close().await?;
+        Ok(())
+    })
+    .await
 }
 
 /// For each incoming stream of `c`, read to end but don't write back.
@@ -89,20 +100,30 @@ pub async fn dev_null_server<T>(mut c: Connection<T>) -> Result<(), ConnectionEr
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    stream::poll_fn(|cx| c.poll_next_inbound(cx))
-        .try_for_each_concurrent(None, |mut stream| async move {
-            let mut buf = [0u8; 1024];
+    stream::poll_fn(|cx| loop {
+        if let Poll::Ready(stream) = c.poll_next_inbound(cx) {
+            return Poll::Ready(Some(stream));
+        }
 
-            while let Ok(n) = stream.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
+        match c.poll(cx) {
+            Poll::Ready(Ok(())) => continue,
+            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+            Poll::Pending => return Poll::Pending,
+        }
+    })
+    .try_for_each_concurrent(None, |mut stream| async move {
+        let mut buf = [0u8; 1024];
+
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 {
+                break;
             }
+        }
 
-            stream.close().await?;
-            Ok(())
-        })
-        .await
+        stream.close().await?;
+        Ok(())
+    })
+    .await
 }
 
 pub struct MessageSender<T> {
@@ -207,29 +228,14 @@ where
                 Poll::Ready(None) | Poll::Pending => {}
             }
 
-            match this.connection.poll_next_inbound(cx)? {
-                Poll::Ready(Some(stream)) => {
-                    drop(stream);
-                    panic!("Did not expect remote to open a stream");
-                }
-                Poll::Ready(None) => {
-                    panic!("Did not expect remote to close the connection");
-                }
+            match this.connection.poll(cx)? {
+                Poll::Ready(()) => continue,
                 Poll::Pending => {}
             }
 
             return Poll::Pending;
         }
     }
-}
-
-/// For each incoming stream, do nothing.
-pub async fn noop_server(c: impl Stream<Item = Result<yamux::Stream, yamux::ConnectionError>>) {
-    c.for_each(|maybe_stream| {
-        drop(maybe_stream);
-        future::ready(())
-    })
-    .await;
 }
 
 /// Send and receive buffer size for a TCP socket.
@@ -294,6 +300,35 @@ pub async fn send_on_single_stream(
     Ok(())
 }
 
+/// Make progress on the given [`Connection`], passing each stream into the given [`mpsc::Sender`].
+pub async fn server<T>(
+    mut c: Connection<T>,
+    mut sender: mpsc::Sender<yamux::Stream>,
+) -> Result<(), ConnectionError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let stream = future::poll_fn(|cx| c.poll_next_inbound(cx)).await?;
+
+        if sender.send(stream).await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// For each incoming stream, do nothing.
+pub async fn noop_server<T>(mut c: Connection<T>) -> Result<(), ConnectionError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let stream = future::poll_fn(|cx| c.poll_next_inbound(cx)).await?;
+
+        drop(stream);
+    }
+}
+
 pub struct EchoServer<T> {
     connection: Connection<T>,
     worker_streams: FuturesUnordered<BoxFuture<'static, yamux::Result<()>>>,
@@ -340,7 +375,7 @@ where
             }
 
             match this.connection.poll_next_inbound(cx) {
-                Poll::Ready(Some(Ok(mut stream))) => {
+                Poll::Ready(Ok(mut stream)) => {
                     this.worker_streams.push(
                         async move {
                             {
@@ -354,7 +389,18 @@ where
                     );
                     continue;
                 }
-                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                Poll::Ready(Err(_)) => {
+                    this.connection_closed = true;
+                    continue;
+                }
+                Poll::Pending => {}
+            }
+
+            match this.connection.poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    continue;
+                }
+                Poll::Ready(Err(_)) => {
                     this.connection_closed = true;
                     continue;
                 }

@@ -156,6 +156,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         }
     }
 
+    /// Allow the connection to make progress by sending pending frames and reading data from the socket.
+    ///
+    /// This will buffer up to 256 new inbound streams and immediately reset any additional ones.
+    /// This function will return [`Poll::Ready`] if it performed some work.
+    /// Similar to [`Stream`](futures::Stream), you should call it again as there is more work to do.
+    pub fn poll(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
+        todo!()
+    }
+
     /// Poll for a new outbound stream.
     ///
     /// This function will fail if the current state does not allow opening new outbound streams.
@@ -176,34 +185,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         continue;
                     }
                 },
-                ConnectionState::Closing(mut inner) => match inner.poll_unpin(cx) {
-                    Poll::Ready(Ok(())) => {
-                        self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Err(ConnectionError::Closed));
-                    }
-                    Poll::Ready(Err(e)) => {
-                        self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Pending => {
-                        self.inner = ConnectionState::Closing(inner);
-                        return Poll::Pending;
-                    }
-                },
-                ConnectionState::Cleanup(mut inner) => match inner.poll_unpin(cx) {
-                    Poll::Ready(e) => {
-                        self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Pending => {
-                        self.inner = ConnectionState::Cleanup(inner);
-                        return Poll::Pending;
-                    }
-                },
-                ConnectionState::Closed => {
-                    self.inner = ConnectionState::Closed;
-                    return Poll::Ready(Err(ConnectionError::Closed));
-                }
+                ConnectionState::Closing(_)
+                | ConnectionState::Cleanup(_)
+                | ConnectionState::Closed => return Poll::Ready(Err(ConnectionError::Closed)),
                 ConnectionState::Poisoned => unreachable!(),
             }
         }
@@ -211,14 +195,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
 
     /// Poll for the next inbound stream.
     ///
-    /// If this function returns `None`, the underlying connection is closed.
-    pub fn poll_next_inbound(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
+    /// In case any streams were buffered in a previous call to [`Connection::poll`], these streams will be returned first.
+    /// Otherwise, try to make progress on the underlying connection to see if there are any new streams.
+    ///
+    /// In other words, this function implies [`Connection::poll`].
+    pub fn poll_next_inbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         loop {
             match std::mem::replace(&mut self.inner, ConnectionState::Poisoned) {
                 ConnectionState::Active(mut active) => match active.poll(cx) {
                     Poll::Ready(Ok(stream)) => {
                         self.inner = ConnectionState::Active(active);
-                        return Poll::Ready(Some(Ok(stream)));
+                        return Poll::Ready(Ok(stream));
                     }
                     Poll::Ready(Err(e)) => {
                         self.inner = ConnectionState::Cleanup(active.cleanup(e));
@@ -229,38 +216,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         return Poll::Pending;
                     }
                 },
-                ConnectionState::Closing(mut closing) => match closing.poll_unpin(cx) {
-                    Poll::Ready(Ok(())) => {
-                        self.inner = ConnectionState::Closed;
-                        return Poll::Ready(None);
-                    }
-                    Poll::Ready(Err(e)) => {
-                        self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    Poll::Pending => {
-                        self.inner = ConnectionState::Closing(closing);
-                        return Poll::Pending;
-                    }
-                },
-                ConnectionState::Cleanup(mut cleanup) => match cleanup.poll_unpin(cx) {
-                    Poll::Ready(ConnectionError::Closed) => {
-                        self.inner = ConnectionState::Closed;
-                        return Poll::Ready(None);
-                    }
-                    Poll::Ready(other) => {
-                        self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Some(Err(other)));
-                    }
-                    Poll::Pending => {
-                        self.inner = ConnectionState::Cleanup(cleanup);
-                        return Poll::Pending;
-                    }
-                },
-                ConnectionState::Closed => {
-                    self.inner = ConnectionState::Closed;
-                    return Poll::Ready(None);
-                }
+                ConnectionState::Closing(_)
+                | ConnectionState::Cleanup(_)
+                | ConnectionState::Closed => return Poll::Ready(Err(ConnectionError::Closed)),
                 ConnectionState::Poisoned => unreachable!(),
             }
         }
