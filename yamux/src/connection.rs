@@ -481,6 +481,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 Poll::Pending => {}
             }
 
+            log::trace!("Polling socket for next frame");
+
             match self.socket.poll_next_unpin(cx) {
                 Poll::Ready(Some(frame)) => {
                     if let Some(stream) = self.on_frame(frame?)? {
