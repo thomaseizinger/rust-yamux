@@ -30,7 +30,9 @@ async fn stream_is_acknowledged_on_first_use() {
         Client::new(connection).await
     };
 
-    let ((), ()) = future::try_join(server, client).await.unwrap();
+    let (server_res, client_res) = future::join(server, client).await;
+    assert!(matches!(server_res, Err(ConnectionError::Closed)));
+    client_res.unwrap();
 }
 
 enum Server<T> {

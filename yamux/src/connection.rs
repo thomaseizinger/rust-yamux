@@ -102,7 +102,7 @@ use crate::{Result, MAX_ACK_BACKLOG};
 use cleanup::Cleanup;
 use closing::Closing;
 use futures::stream::SelectAll;
-use futures::{channel::mpsc, future::Either, prelude::*, sink::SinkExt, stream::Fuse};
+use futures::{channel::mpsc, future::Either, prelude::*, ready, sink::SinkExt, stream::Fuse};
 use nohash_hasher::IntMap;
 use std::collections::VecDeque;
 use std::task::{Context, Waker};
@@ -161,8 +161,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// This will buffer up to 256 new inbound streams and immediately reset any additional ones.
     /// This function will return [`Poll::Ready`] if it performed some work.
     /// Similar to [`Stream`](futures::Stream), you should call it again as there is more work to do.
-    pub fn poll(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
-        todo!()
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        loop {
+            match std::mem::replace(&mut self.inner, ConnectionState::Poisoned) {
+                ConnectionState::Active(mut active) => match active.poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.inner = ConnectionState::Active(active);
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.inner = ConnectionState::Cleanup(active.cleanup(e));
+                        continue;
+                    }
+                    Poll::Pending => {
+                        self.inner = ConnectionState::Active(active);
+                        return Poll::Pending;
+                    }
+                },
+                state @ (ConnectionState::Closing(_)
+                | ConnectionState::Cleanup(_)
+                | ConnectionState::Closed) => {
+                    self.inner = state;
+                    return Poll::Ready(Err(ConnectionError::Closed));
+                }
+                ConnectionState::Poisoned => unreachable!(),
+            }
+        }
     }
 
     /// Poll for a new outbound stream.
@@ -202,20 +226,34 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     pub fn poll_next_inbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         loop {
             match std::mem::replace(&mut self.inner, ConnectionState::Poisoned) {
-                ConnectionState::Active(mut active) => match active.poll(cx) {
-                    Poll::Ready(Ok(stream)) => {
-                        self.inner = ConnectionState::Active(active);
-                        return Poll::Ready(Ok(stream));
+                ConnectionState::Active(mut active) => {
+                    match active.poll_next_inbound(cx) {
+                        Poll::Ready(Ok(stream)) => {
+                            self.inner = ConnectionState::Active(active);
+                            return Poll::Ready(Ok(stream));
+                        }
+                        Poll::Ready(Err(e)) => {
+                            self.inner = ConnectionState::Cleanup(active.cleanup(e));
+                            continue;
+                        }
+                        Poll::Pending => {}
                     }
-                    Poll::Ready(Err(e)) => {
-                        self.inner = ConnectionState::Cleanup(active.cleanup(e));
-                        continue;
+
+                    match active.poll(cx) {
+                        Poll::Ready(Ok(())) => {
+                            self.inner = ConnectionState::Active(active);
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            self.inner = ConnectionState::Cleanup(active.cleanup(e));
+                            continue;
+                        }
+                        Poll::Pending => {
+                            self.inner = ConnectionState::Active(active);
+                            return Poll::Pending;
+                        }
                     }
-                    Poll::Pending => {
-                        self.inner = ConnectionState::Active(active);
-                        return Poll::Pending;
-                    }
-                },
+                }
                 ConnectionState::Closing(_)
                 | ConnectionState::Cleanup(_)
                 | ConnectionState::Closed => return Poll::Ready(Err(ConnectionError::Closed)),
@@ -318,6 +356,8 @@ struct Active<T> {
 
     pending_frames: VecDeque<Frame<()>>,
     new_outbound_stream_waker: Option<Waker>,
+
+    pending_streams: Vec<Stream>,
 }
 
 /// `Stream` to `Connection` commands.
@@ -389,6 +429,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             },
             pending_frames: VecDeque::default(),
             new_outbound_stream_waker: None,
+            pending_streams: vec![],
         }
     }
 
@@ -406,7 +447,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         Cleanup::new(self.stream_receivers, error)
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         loop {
             if self.socket.poll_ready_unpin(cx).is_ready() {
                 if let Some(frame) = self.pending_frames.pop_front() {
@@ -442,7 +483,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             match self.socket.poll_next_unpin(cx) {
                 Poll::Ready(Some(frame)) => {
                     if let Some(stream) = self.on_frame(frame?)? {
-                        return Poll::Ready(Ok(stream));
+                        if self.pending_streams.len() >= 256 {
+                            let mut header = Header::data(stream.id(), 0);
+                            header.rst();
+
+                            self.pending_frames.push_back(Frame::new(header).into());
+                            continue;
+                        }
+
+                        // TODO: Do we need to wake here if `pending_streams` was empty?
+
+                        self.pending_streams.push(stream);
                     }
                     continue;
                 }
@@ -454,6 +505,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
             // If we make it this far, at least one of the above must have registered a waker.
             return Poll::Pending;
+        }
+    }
+
+    fn poll_next_inbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
+        loop {
+            if let Some(stream) = self.pending_streams.pop() {
+                return Poll::Ready(Ok(stream));
+            }
+
+            ready!(self.poll(cx))?;
         }
     }
 

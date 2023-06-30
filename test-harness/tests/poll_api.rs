@@ -187,11 +187,10 @@ fn prop_config_send_recv_single() {
                 future::select(pin!(client_task), pin!(send_on_single_stream(stream, msgs))).await;
 
                 future::poll_fn(|cx| client.poll_close(cx)).await.unwrap();
-
-                Ok(())
             };
 
-            futures::future::try_join(server, client).await?;
+            let (server_res, ()) = futures::future::join(server, client).await;
+            assert!(matches!(server_res, Err(ConnectionError::Closed)));
 
             Ok(())
         })

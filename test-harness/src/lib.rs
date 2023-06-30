@@ -357,6 +357,17 @@ where
         let this = self.get_mut();
 
         loop {
+            match this.connection.poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    continue;
+                }
+                Poll::Ready(Err(_)) => {
+                    this.connection_closed = true;
+                    continue;
+                }
+                Poll::Pending => {}
+            }
+
             match this.worker_streams.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(()))) => {
                     this.streams_processed += 1;
@@ -387,17 +398,6 @@ where
                         }
                         .boxed(),
                     );
-                    continue;
-                }
-                Poll::Ready(Err(_)) => {
-                    this.connection_closed = true;
-                    continue;
-                }
-                Poll::Pending => {}
-            }
-
-            match this.connection.poll(cx) {
-                Poll::Ready(Ok(())) => {
                     continue;
                 }
                 Poll::Ready(Err(_)) => {
