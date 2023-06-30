@@ -351,7 +351,7 @@ impl AsyncRead for Stream {
         }
 
         if n > 0 {
-            log::trace!("{}/{}: read {} bytes", self.conn, self.id, n);
+            log::trace!("{}/{}: read {} bytes: {}", self.conn, self.id, n, String::from_utf8_lossy(&buf[..n]));
             return Poll::Ready(Ok(n));
         }
 
@@ -398,7 +398,7 @@ impl AsyncWrite for Stream {
         let n = body.len();
         let mut frame = Frame::data(self.id, body).expect("body <= u32::MAX").left();
         self.add_flag(frame.header_mut());
-        log::trace!("{}/{}: write {} bytes", self.conn, self.id, n);
+        log::trace!("{}/{}: write {} bytes: {}", self.conn, self.id, n, String::from_utf8_lossy(&buf[..n]));
 
         // technically, the frame hasn't been sent yet on the wire but from the perspective of this data structure, we've queued the frame for sending
         if frame.header().flags().contains(ACK) {
